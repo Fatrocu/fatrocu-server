@@ -1,0 +1,23 @@
+[package]
+name = "fatrocu-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-multipart = "0.6"
+uuid = { version = "1", features = ["v4"] }
+
+actix-web = { version = "4", features = ["macros"] }
+
+
+
+
+
+serde = { version = "1.0", features = ["derive"] }
+
+futures-util = "0.3"
+
+tokio = { version = "1", features = ["full"] }
+dotenv = "0.15"
+actix-rt = "2"
+
