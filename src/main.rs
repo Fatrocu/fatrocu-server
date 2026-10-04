@@ -46,8 +46,7 @@ async fn process(mut payload: Multipart) -> impl Responder {
             // Save the uploaded image to a temp file
             let tmp = env::temp_dir().join(format!("upload_{}.png", Uuid::new_v4()));
             let mut f = std::fs::File::create(&tmp).unwrap();
-            let mut stream = field;
-            while let Some(chunk) = stream.next().await {
+            while let Some(chunk) = field.next().await {
                 let data = chunk.unwrap();
                 use std::io::Write;
                 f.write_all(&data).unwrap();
