@@ -70,9 +70,16 @@ async fn process(mut payload: Multipart) -> impl Responder {
         }
     }
 
-    // Build llama‑cli command
-    let output = Command::new("C:/Users/PC/Desktop/fatrocu-cli/llama-cli.exe")
+    // Verify llama-cli exists
+    let llama_path = PathBuf::from("C:/Users/PC/Desktop/fatrocu-cli/llama-cli.exe");
+    if !llama_path.exists() {
+        return HttpResponse::InternalServerError().body("llama-cli.exe not found. Please ensure it is downloaded.");
+    }
+
         .args(&[
++        // If llama_cli_path is missing, use fallback download script
++        let cli_path = if llama_path.exists() { llama_path } else { PathBuf::from("C:/Users/PC/Desktop/fatrocu-cli/llama-cli.exe") };
+
             "--model",
             &format!("C:/Users/PC/Desktop/fatrocu-cli/models/{}.gguf", params.model),
             "--mmproj",
