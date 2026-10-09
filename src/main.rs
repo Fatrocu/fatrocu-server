@@ -19,14 +19,16 @@
 use actix_multipart::Multipart;
 use actix_web::{post, get, web, App, HttpResponse, HttpServer, Responder};
 
-use futures_util::{StreamExt, SinkExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
+use dotenv::dotenv;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Canonical model used by every Fatrocu component.
@@ -164,7 +166,7 @@ pub async fn process(payload: Multipart) -> impl Responder {
     }
 
     // Run the model runner if configured; otherwise return a valid envelope.
-    let image_name = image_path.as_ref().unwrap().file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let image_name = Path::new(image_path.as_ref().unwrap()).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let runner = env::var("FATROCU_SERVER_BIN").ok();
 
     let response = match runner {
