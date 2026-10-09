@@ -4,3 +4,4 @@ target/
 .DS_Store
 # Windows
 Thumbs.db
+.pi/
