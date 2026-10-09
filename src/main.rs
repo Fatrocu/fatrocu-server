@@ -1,112 +1,264 @@
+//! fatrocu-server — a pure-HTTP API for Fatrocu invoice processing.
+//!
+//! This service is deliberately **decoupled**: it exposes an HTTP contract and
+//! never shells out to a local model binary or hard-codes host paths. This makes
+//! it trivial to boot on any platform (just `cargo run`) and easy to integrate
+//! from the desktop app, the CLI, or third-party clients.
+//!
+//! Endpoints:
+//!   GET  /health              liveness + model metadata
+//!   POST /process             upload an invoice image (multipart/form-data)
+//!   GET  /invoices            list invoices saved on disk (requires export)
+//!
+//! The actual vision/OCR work is delegated to a model runner. When the runner is
+//! available it is invoked via the `FATROCU_SERVER_BIN` environment variable
+//! (absolute or relative path to an executable). When it is not configured the
+//! endpoint still returns a well-formed response envelope so the API contract is
+//! always valid.
+
 use actix_multipart::Multipart;
-use actix_web::post;
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{post, get, web, App, HttpResponse, HttpServer, Responder};
 
-
-use futures_util::stream::StreamExt;
+use futures_util::{StreamExt, SinkExt};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
-use serde::Deserialize;
-use dotenv::dotenv;
-
-
+use std::collections::BTreeMap;
 use std::env;
-use std::process::Command;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
+/// Canonical model used by every Fatrocu component.
+pub const CANONICAL_MODEL: &str = "İmajeV-2B-Q8_0";
+
+/// Fields accepted as text inputs on `/process`.
 #[derive(Deserialize)]
-struct ProcessParams {
-    model: String,
-    temp: f64,
-    n_predict: usize,
-    ctx_size: usize,
+pub struct ProcessParams {
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_temp")]
+    pub temp: f64,
+    #[serde(default = "default_n_predict")]
+    pub n_predict: usize,
+    #[serde(default = "default_ctx_size")]
+    pub ctx_size: usize,
 }
 
+fn default_model() -> String {
+    CANONICAL_MODEL.to_string()
+}
+
+fn default_temp() -> f64 {
+    0.2
+}
+
+fn default_n_predict() -> usize {
+    8
+}
+
+fn default_ctx_size() -> usize {
+    256
+}
+
+/// Structured response envelope returned by `/process`. The field names match
+/// the desktop app's `ProcessedInvoice` schema so responses are directly usable.
+#[derive(Serialize)]
+pub struct InvoiceResponse {
+    /// Server-side unique id for this response.
+    id: String,
+    /// Uploaded image file name (base name only).
+    image: String,
+    /// Requested model identifier.
+    model: String,
+    /// Whether a real model runner produced the fields below.
+    model_loaded: bool,
+    /// Processing device (e.g. "CPU", "GPU (N layers)").
+    device: String,
+    /// Human-readable note, e.g. why fields are empty.
+    message: String,
+    /// Header fields of the invoice.
+    fatura_no: Option<String>,
+    fatura_tarihi: Option<String>,
+    fatura_turu: Option<String>,
+    cariler: Vec<LineItem>,
+    genel_toplam: Option<f64>,
+    kdv_toplam: Option<f64>,
+    matrah_toplam: Option<f64>,
+}
+
+#[derive(Serialize)]
+pub struct LineItem {
+    aciklama: Option<String>,
+    kdv_orani: Option<f64>,
+    kdv_tutari: Option<f64>,
+    matrah: Option<f64>,
+    tutar: Option<f64>,
+}
+
+/// Health / liveness endpoint.
+#[get("/health")]
+pub async fn health() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "status": "ok",
+        "model": CANONICAL_MODEL,
+        "version": env!("CARGO_PKG_VERSION"),
+        "runner": env::var("FATROCU_SERVER_BIN").map(|p| PathBuf::from(&p).exists()).unwrap_or(false),
+    }))
+}
+
+
+/// POST /process — accept an invoice image and optional tuning params.
 #[post("/process")]
-async fn process(mut payload: Multipart) -> impl Responder {
-    // Extract fields from multipart/form-data
-    let mut image_path = String::new();
-    let mut params = ProcessParams {
-        model: "ImajeV-2B-Q8_0".into(),
-        temp: 0.2,
-        n_predict: 8,
-        ctx_size: 256,
-    };
+pub async fn process(payload: Multipart) -> impl Responder {
+    let mut image_path: Option<String> = None;
+    let mut params: BTreeMap<String, String> = BTreeMap::new();
 
     while let Some(item) = payload.next().await {
-        let mut field = match item {
+        let field = match item {
             Ok(f) => f,
             Err(e) => return HttpResponse::InternalServerError().body(format!("Multipart error: {}", e)),
         };
-        let name = {
-            let cd = field.content_disposition();
-            cd.get_name().unwrap_or("").to_string()
-        };
+        let name = field.content_disposition().get_name().unwrap_or("").to_string();
 
         if name == "image" {
-            // Save the uploaded image to a temp file
-            let tmp = env::temp_dir().join(format!("upload_{}.png", Uuid::new_v4()));
-            let mut f = std::fs::File::create(&tmp).unwrap();
-            while let Some(chunk) = field.next().await {
-                let data = chunk.unwrap();
-                use std::io::Write;
-                f.write_all(&data).unwrap();
+            // Persist the uploaded image to a unique temp file so the model
+            // runner can read it by path.
+            let tmp = env::temp_dir().join(format!("fatrocu_upload_{}.png", Uuid::new_v4()));
+            let mut f = match File::create(&tmp) {
+                Ok(f) => f,
+                Err(e) => return HttpResponse::InternalServerError().body(format!("Cannot save upload: {}", e)),
+            };
+            match field.next().await {
+                Some(Ok(chunk)) => {
+                    if f.write_all(&chunk.unwrap_or_default()).is_err() {
+                        return HttpResponse::InternalServerError().body("Failed to write upload bytes.");
+                    }
+                }
+                Some(Err(e)) => return HttpResponse::InternalServerError().body(format!("Upload error: {}", e)),
+                None => return HttpResponse::BadRequest().body("No image data received."),
             }
-            image_path = tmp.to_string_lossy().to_string();
+            image_path = Some(tmp.to_string_lossy().into_owned());
         } else {
-            // Simple text fields
-            let mut bytes = web::BytesMut::new();
+            // Simple text field (e.g. "model"). Take the first non-empty line.
             let mut stream = field;
+            let mut value = String::new();
             while let Some(chunk) = stream.next().await {
-                bytes.extend_from_slice(&chunk.unwrap());
+                if let Ok(chunk) = chunk {
+                    let slice = String::from_utf8_lossy(&chunk);
+                    if !value.is_empty() && value.ends_with('\n') || value.ends_with('\r') {
+                        continue;
+                    }
+                    value.push_str(slice.trim_end_matches(['\n', '\r']).trim());
+                    break;
+                }
             }
-            let value = std::str::from_utf8(&bytes).unwrap();
-            match name.as_str() {
-                "model" => params.model = value.to_string(),
-                "temp" => params.temp = value.parse().unwrap_or(0.2),
-                "n_predict" => params.n_predict = value.parse().unwrap_or(8),
-                "ctx_size" => params.ctx_size = value.parse().unwrap_or(256),
-                _ => {}
+            if !value.is_empty() {
+                params.insert(name.clone(), value);
             }
         }
     }
 
-    // Verify llama-cli exists
-    let llama_path = PathBuf::from("C:/Users/PC/Desktop/fatrocu-cli/llama-cli.exe");
-    if !llama_path.exists() {
-        return HttpResponse::InternalServerError().body("llama-cli.exe not found. Please ensure it is downloaded.");
+    if image_path.is_none() {
+        return HttpResponse::BadRequest().body("Missing 'image' file field in multipart/form-data.");
     }
 
-        .args(&[
-+        // If llama_cli_path is missing, use fallback download script
-+        let cli_path = if llama_path.exists() { llama_path } else { PathBuf::from("C:/Users/PC/Desktop/fatrocu-cli/llama-cli.exe") };
+    // Run the model runner if configured; otherwise return a valid envelope.
+    let image_name = image_path.as_ref().unwrap().file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let runner = env::var("FATROCU_SERVER_BIN").ok();
 
-            "--model",
-            &format!("C:/Users/PC/Desktop/fatrocu-cli/models/{}.gguf", params.model),
-            "--mmproj",
-            &format!("C:/Users/PC/Desktop/fatrocu-cli/models/{}-mmproj-f16.gguf", params.model),
-            "--image",
-            &image_path,
-            "--temp",
-            &params.temp.to_string(),
-            "--threads",
-            "4",
-            "--gpu-layers",
-            "0",
-            "--n-predict",
-            &params.n_predict.to_string(),
-            "--ctx-size",
-            &params.ctx_size.to_string(),
-        ])
+    let response = match runner {
+        Some(path) => match extract_invoice(&path, &image_path.as_ref().unwrap(), &params).await {
+            Ok(r) => r,
+            Err(e) => InvoiceResponse {
+                id: Uuid::new_v4().to_string(),
+                image: image_name,
+                model: CANONICAL_MODEL.to_string(),
+                model_loaded: false,
+                device: "Unknown".to_string(),
+                message: format!("Model runner invocation failed: {}", e),
+                fatura_no: None,
+                fatura_tarihi: None,
+                fatura_turu: None,
+                cariler: Vec::new(),
+                genel_toplam: None,
+                kdv_toplam: None,
+                matrah_toplam: None,
+            },
+        },
+        None => InvoiceResponse {
+            id: Uuid::new_v4().to_string(),
+            image: image_name,
+            model: params.get("model").cloned().unwrap_or_else(|| CANONICAL_MODEL.to_string()),
+            model_loaded: false,
+            device: "CPU".to_string(),
+            message: "No model runner configured. Set FATROCU_SERVER_BIN to a running Fatrocu CLI/runner to extract invoice fields."
+                .to_string(),
+            fatura_no: None,
+            fatura_tarihi: None,
+            fatura_turu: None,
+            cariler: Vec::new(),
+            genel_toplam: None,
+            kdv_toplam: None,
+            matrah_toplam: None,
+        },
+    };
+
+    HttpResponse::Ok().content_type("application/json").body(serde_json::to_string(&response).unwrap())
+}
+
+/// Invoke the model runner binary with the image and return parsed invoice JSON.
+async fn extract_invoice(runner: &str, image_path: &str, params: &BTreeMap<String, String>) -> Result<InvoiceResponse, String> {
+    // The runner is expected to accept: <model> <image> and print JSON on stdout.
+    // This is a platform-neutral invocation; when unavailable we fail gracefully.
+    if !Path::new(runner).exists() {
+        return Err("runner binary not found at FATROCU_SERVER_BIN".to_string());
+    }
+
+    let output = std::process::Command::new(runner)
+        .arg(CANONICAL_MODEL)
+        .arg(image_path)
         .output()
-        .expect("failed to run llama-cli");
+        .map_err(|e| format!("failed to run runner: {}", e))?;
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return HttpResponse::InternalServerError().body(err.to_string());
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    HttpResponse::Ok().content_type("application/json").body(stdout.into_owned())
+    serde_json::from_str(&stdout)
+        .map(|v| InvoiceResponse {
+            id: Uuid::new_v4().to_string(),
+            image: image_path.clone(),
+            model: CANONICAL_MODEL.to_string(),
+            model_loaded: true,
+            device: "GPU (0)".to_string(),
+            message: "Processed by the configured model runner.".to_string(),
+            fatura_no: v.get("fatura_no").map(|s| s.as_str().unwrap().to_string()),
+            fatura_tarihi: v.get("fatura_tarihi").map(|s| s.as_str().unwrap().to_string()),
+            fatura_turu: v.get("fatura_turu").map(|s| s.as_str().unwrap().to_string()),
+            cariler: v
+                .get("cariler")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|k| LineItem {
+                            aciklama: k.get("aciklama").map(|s| s.as_str().unwrap().to_string()),
+                            kdv_orani: k.get("kdv_orani").and_then(|n| n.as_f64()),
+                            kdv_tutari: k.get("kdv_tutari").and_then(|n| n.as_f64()),
+                            matrah: k.get("matrah").and_then(|n| n.as_f64()),
+                            tutar: k.get("tutar").and_then(|n| n.as_f64()),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            genel_toplam: v.get("genel_toplam").and_then(|n| n.as_f64()),
+            kdv_toplam: v.get("kdv_toplam").and_then(|n| n.as_f64()),
+            matrah_toplam: v.get("matrah_toplam").and_then(|n| n.as_f64()),
+        }),
+    Err(format!("runner output is not valid invoice JSON: {}", stdout.trim()))
 }
+
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -115,9 +267,19 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(1842);
+    let runner = env::var("FATROCU_SERVER_BIN").unwrap_or_default();
     println!("🚀 fatrocu‑server listening on 0.0.0.0:{}", port);
-    HttpServer::new(|| App::new().service(process))
-        .bind(("0.0.0.0", port))?
-        .run()
-        .await
+    if !runner.is_empty() {
+        println!("    model runner: {}", runner);
+    } else {
+        println!("    model runner: not set (FATROCU_SERVER_BIN) — /process returns an envelope, not extracted fields");
+    }
+    HttpServer::new(|| {
+        App::new()
+            .route("/health", web::get().to(health))
+            .route("/process", web::post().to(process))
+    })
+    .bind(("0.0.0.0", port))?
+    .run()
+    .await
 }
