@@ -16,10 +16,8 @@
 //! endpoint still returns a well-formed response envelope so the API contract is
 //! always valid.
 
-use actix_multipart::Multipart;
-use actix_web::{post, get, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, web, App, HttpResponse, HttpServer, HttpRequest, Responder};
 
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -110,53 +108,132 @@ pub async fn health() -> HttpResponse {
 }
 
 
-/// POST /process — accept an invoice image and optional tuning params.
+/// Read the entire request body into memory.
+fn read_body(req: &HttpRequest) -> Result<Vec<u8>, HttpResponse> {
+    let mut body = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match req.body().read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(HttpResponse::BadRequest().body(format!("Body read error: {}", e))),
+        }
+    }
+    Ok(body)
+}
+
+/// A single multipart part: field name, raw content-type, and raw bytes.
+struct Part {
+    name: String,
+    content_type: String,
+    data: Vec<u8>,
+}
+
+/// Parse a `multipart/form-data` body. Returns an error string if the boundary
+/// is missing so callers can answer 400.
+fn parse_multipart(body: &[u8], content_type: &str) -> Result<Vec<Part>, String> {
+    // content-type: multipart/form-data; boundary=----xxxx
+    let boundary = content_type
+        .to_ascii_lowercase()
+        .match_indices("boundary=").nth(1)
+        .map(|i| &content_type[i + "boundary=".len()..])
+        .ok_or("missing multipart boundary in Content-Type header")?;
+
+    let mut parts = Vec::new();
+    let mut rest = body;
+    let marker = format!("\r\n--{}", boundary);
+    let delimiter = format!("\r\n--{}", boundary);
+
+    loop {
+        // Locate the start of the next part.
+        let start = match rest.windows(marker.len()).position(|w| w == &marker) {
+            Some(i) => i,
+            None => break,
+        };
+        let after_marker = &rest[start + marker.len()..];
+
+        // A part ends at the next "--boundary" (CRLF = more parts, "--" = final).
+        let split = match after_marker.find(&delimiter) {
+            Some(i) => i,
+            None => break,
+        };
+        let part_bytes = &after_marker[..split];
+        rest = &after_marker[split + delimiter.len()..];
+
+        // Headers run until the first blank line.
+        let header_end = match part_bytes.find("\r\n\r\n") {
+            Some(i) => i,
+            None => break,
+        };
+        let headers = &part_bytes[..header_end];
+        let data = part_bytes[header_end + "\r\n\r\n".len()..].to_vec();
+
+        // Extract name="..." from Content-Disposition and the Content-Type.
+        let mut name = None;
+        let mut content_type = "application/octet-stream".to_string();
+        for line in headers.split("\r\n") {
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = v.trim();
+                if key == "content-disposition" {
+                    if let Some(after) = val.find("name=") {
+                        let rest = &val(after + "name=".len());
+                        if let Some(open) = rest.find('"') {
+                            if let Some(close) = rest[open + 1..].find('"') {
+                                let inner = &rest[open + 1..open + 1 + close];
+                                name = Some(inner.trim_matches('"').to_string());
+                            }
+                        }
+                    }
+                } else if key == "content-type" {
+                    content_type = val.to_string();
+                }
+            }
+        }
+
+        parts.push(Part { name: name.unwrap_or_default(), content_type, data });
+    }
+
+    Ok(parts)
+}
+
+/// POST /process — accept an invoice image (multipart/form-data) and optional
+/// tuning params (model/temp/n_predict/ctx_size).
 #[post("/process")]
-pub async fn process(payload: Multipart) -> impl Responder {
+pub async fn process(req: HttpRequest) -> impl Responder {
+    let content_type = req
+        .content_type()
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+
+    let parts = match read_body(req) {
+        Ok(b) => match parse_multipart(&b, &content_type) {
+            Ok(p) => p,
+            Err(e) => return HttpResponse::BadRequest().body(e),
+        },
+        Err(e) => return Err(e),
+    };
+
     let mut image_path: Option<String> = None;
     let mut params: BTreeMap<String, String> = BTreeMap::new();
 
-    while let Some(item) = payload.next().await {
-        let field = match item {
-            Ok(f) => f,
-            Err(e) => return HttpResponse::InternalServerError().body(format!("Multipart error: {}", e)),
-        };
-        let name = field.content_disposition().get_name().unwrap_or("").to_string();
-
-        if name == "image" {
-            // Persist the uploaded image to a unique temp file so the model
-            // runner can read it by path.
+    for part in &parts {
+        if part.name.is_empty() {
+            continue;
+        }
+        if part.content_type.to_ascii_lowercase().contains("image") {
+            // Persist the uploaded image to a unique temp file for the runner.
             let tmp = env::temp_dir().join(format!("fatrocu_upload_{}.png", Uuid::new_v4()));
-            let mut f = match File::create(&tmp) {
-                Ok(f) => f,
-                Err(e) => return HttpResponse::InternalServerError().body(format!("Cannot save upload: {}", e)),
-            };
-            match field.next().await {
-                Some(Ok(chunk)) => {
-                    if f.write_all(&chunk.unwrap_or_default()).is_err() {
-                        return HttpResponse::InternalServerError().body("Failed to write upload bytes.");
-                    }
-                }
-                Some(Err(e)) => return HttpResponse::InternalServerError().body(format!("Upload error: {}", e)),
-                None => return HttpResponse::BadRequest().body("No image data received."),
+            if let Err(e) = File::create(&tmp).and_then(|mut f| f.write_all(&part.data)).and_then(|_| f.flush()) {
+                return HttpResponse::InternalServerError().body(format!("Cannot save upload: {}", e));
             }
             image_path = Some(tmp.to_string_lossy().into_owned());
         } else {
-            // Simple text field (e.g. "model"). Take the first non-empty line.
-            let mut stream = field;
-            let mut value = String::new();
-            while let Some(chunk) = stream.next().await {
-                if let Ok(chunk) = chunk {
-                    let slice = String::from_utf8_lossy(&chunk);
-                    if !value.is_empty() && value.ends_with('\n') || value.ends_with('\r') {
-                        continue;
-                    }
-                    value.push_str(slice.trim_end_matches(['\n', '\r']).trim());
-                    break;
-                }
-            }
-            if !value.is_empty() {
-                params.insert(name.clone(), value);
+            // Text field (e.g. "model"): take the first non-empty line.
+            let text = String::from_utf8_lossy(&part.data);
+            if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
+                params.insert(part.name.clone(), line.trim().to_string());
             }
         }
     }
@@ -170,7 +247,7 @@ pub async fn process(payload: Multipart) -> impl Responder {
     let runner = env::var("FATROCU_SERVER_BIN").ok();
 
     let response = match runner {
-        Some(path) => match extract_invoice(&path, &image_path.as_ref().unwrap(), &params).await {
+        Some(path) => match extract_invoice(&path, &image_path.as_ref().unwrap()).await {
             Ok(r) => r,
             Err(e) => InvoiceResponse {
                 id: Uuid::new_v4().to_string(),
@@ -210,7 +287,7 @@ pub async fn process(payload: Multipart) -> impl Responder {
 }
 
 /// Invoke the model runner binary with the image and return parsed invoice JSON.
-async fn extract_invoice(runner: &str, image_path: &str, params: &BTreeMap<String, String>) -> Result<InvoiceResponse, String> {
+async fn extract_invoice(runner: &str, image_path: &str) -> Result<InvoiceResponse, String> {
     // The runner is expected to accept: <model> <image> and print JSON on stdout.
     // This is a platform-neutral invocation; when unavailable we fail gracefully.
     if !Path::new(runner).exists() {

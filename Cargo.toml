@@ -5,17 +5,15 @@ edition = "2021"
 description = "Pure-HTTP invoice-processing API for Fatrocu (decoupled from any local model binary)."
 
 [dependencies]
-# HTTP framework (multipart body support required for /process).
-actix-web = { version = "4.15.0", features = ["macros", "multipart"] }
-actix-multipart = "0.6.2"
+# HTTP framework (multipart parsing is done manually in /process, so no
+# extra multipart feature is required).
+actix-web = { version = "4.15.0", features = ["macros"] }
 # Optional model runner: when FATROCU_SERVER_BIN points to a working runner,
 # /process returns extracted invoice fields instead of an empty envelope.
 uuid = { version = "1.27.0", features = ["v4"] }
 # JSON request/response encoding.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
-# Async stream iteration for multipart parts.
-futures-util = "0.3.34"
 # Load .env if present.
 dotenv = "0.15.0"
 
