@@ -275,7 +275,7 @@ async fn list() -> Result<impl Responder, String> {
 
 async fn export() -> Result<impl Responder, String> {
     let invoices = crate::AppState::instance(0).get_invoices();
-    let file = save_xlsx(&invoices)?;
+    let file = save_xlsx(&invoices).map_err(|e| e.to_string())?;
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         .attachment("Fatrocu_Raporu.xlsx", file))
@@ -327,48 +327,6 @@ fn save_xlsx(invoices: &[ProcessedDocument]) -> std::io::Result<PathBuf> {
     sheet.finish(&mut workbook)?;
     workbook.write_to_file(&path)?;
     Ok(path)
-}
-    let mut row = 0i32;
-    sheet.write(0, 0, "Page")?;
-    sheet.write(0, 1, "Fatura No")?;
-    sheet.write(0, 2, "Fatura Tarihi")?;
-    sheet.write(0, 3, "Satıcı Ünvan")?;
-    sheet.write(0, 4, "Satıcı VKN/TCKN")?;
-    sheet.write(0, 5, "Matrah")?;
-    sheet.write(0, 6, "KDV Oranı")?;
-    sheet.write(0, 7, "KDV Tutarı")?;
-    sheet.write(0, 8, "Genel Toplam")?;
-    sheet.write(0, 9, "ETTN UUID")?;
-    row += 1;
-    for inv in invoices {
-        let p = inv.page.clone().unwrap_or_default();
-        let n = inv.fatura_no.clone().unwrap_or_default();
-        let t = inv.fatura_tarihi.clone().unwrap_or_default();
-        let u = inv.cari_unvan.clone().unwrap_or_default();
-        let v = inv.cari_vergi_no.clone().unwrap_or_default();
-        let m = inv.mal_hizmet_toplam_matrah;
-        let k = inv.kdv_orani;
-        let d = inv.kdv_tutari;
-        let g = inv.genel_toplam;
-        let e = inv.ettn_uuid.clone().unwrap_or_default();
-        sheet.write(row, 0, &p)?;
-        sheet.write(row, 1, &n)?;
-        sheet.write(row, 2, &t)?;
-        sheet.write(row, 3, &u)?;
-        sheet.write(row, 4, &v)?;
-        sheet.write(row, 5, &m)?;
-        sheet.write(row, 6, &k)?;
-        sheet.write(row, 7, &d)?;
-        sheet.write(row, 8, &g)?;
-        sheet.write(row, 9, &e)?;
-        row += 1;
-    }
-    let mut opts = Sheet::default();
-    opts.set_column_width(0, 0, 60)?;
-    sheet.finish(&mut opts)?;
-    sheet.finish(&mut workbook)?;
-    workbook.finish()?;
-    Ok(std::path::PathBuf::from("Fatrocu_Raporu.xlsx"))
 }
 
 fn main() {
