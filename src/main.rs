@@ -1,325 +1,347 @@
-// Fatrocu Server — pure HTTP REST API for invoice extraction.
-//
-// Decoupled design: this binary exposes HTTP endpoints only. It never shells
-// out to a local model binary and carries no hardcoded user paths, so it can
-// be started on any machine and pointed at a model by its name.
-//
-// Model running is delegated to an optional external runner binary whose
-// absolute path is supplied at build time via the FATROCU_SERVER_BIN
-// environment variable. If that variable is unset, the server still boots and
-// reports an "unconfigured" runner status; callers simply cannot run yet.
-
+use actix_web::app::App;
 use actix_web::body::MessageBody;
-use actix_web::dev::{Payload, PayloadReader};
-use actix_web::http::header::{ContentType, ImageFormat};
-use actix_web::web::{self, Bytes};
-use actix_web::{post, get, HttpMessage, HttpResponse};
-use actix_web::{Error, HttpRequest};
+use actix_web::middleware::Logger;
+use actix_web::post;
+use actix_web::prelude::*;
+use actix_web::HttpResponse;
+use actix_web::HttpRequest;
+
+use dotenv::dotenv;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
-use std::env;
-use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const CANONICAL_MODEL: &str = "İmajeV-2B-Q8_0";
-const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_PORT: u16 = 1842;
 
-/// Runner binary path, injected at build time. Optional: unset => unconfigured.
-fn runner_path() -> Option<PathBuf> {
-    env::var("FATROCU_SERVER_BIN")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessedDocument {
+    page: Option<String>,
+    fatura_no: Option<String>,
+    fatura_tarihi: Option<String>,
+    cari_unvan: Option<String>,
+    cari_vergi_no: Option<String>,
+    ettn_uuid: Option<String>,
+    mal_hizmet_toplam_matrah: f64,
+    kdv_orani: f64,
+    kdv_tutari: f64,
+    genel_toplam: f64,
+    kalemler: Vec<LineItem>,
 }
 
-/// Reads the whole request body into a Vec<u8>.
-async fn read_body(req: &HttpRequest) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = req.body().read(&mut buf).await.unwrap_or(0);
-        if n == 0 {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LineItem {
+    fatura_no: Option<String>,
+    kdv_matrahi: f64,
+    kdv_tutari: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: String,
+    model: String,
+    canonical_model: String,
+    version: &'static str,
+    runner: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InvoicesResponse {
+    count: usize,
+    invoices: Vec<ProcessedDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextParams {
+    #[serde(default)]
+    model: String,
+    #[serde(default = "default_temp")]
+    temp: f64,
+    #[serde(default = "default_n_predict")]
+    n_predict: u32,
+    #[serde(default = "default_ctx_size")]
+    ctx_size: u32,
+}
+
+fn default_temp() -> f64 {
+    0.2
+}
+
+fn default_n_predict() -> u32 {
+    8
+}
+
+fn default_ctx_size() -> u32 {
+    256
+}
+
+fn runner_path() -> Option<String> {
+    std::env::var("FATROCU_SERVER_BIN").ok().filter(|p| !p.is_empty())
+}
+
+fn extract_field(body: &[u8], name: &str) -> Option<String> {
+    let header = body.to_ascii_lowercase();
+    let marker = format!("name=\"{}\"", name);
+    let start = header.find(&marker)?;
+    let after_marker = start + marker.len();
+    let end_marker = format!(";filename=\"");
+    let end = header[after_marker..]
+        .find(&end_marker)
+        .map(|o| after_marker + o)
+        .unwrap_or(header.len());
+    Some(String::from_utf8_lossy(&header[after_marker..end]).into_owned())
+}
+
+fn split_fields(body: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let boundary = extract_field(body, "boundary").unwrap_or_default();
+    if boundary.is_empty() {
+        return Vec::new();
+    }
+    let mut b = body.to_vec();
+    let prefix = format!("--{}", boundary);
+    let suffix = format!("--{}--", boundary);
+    let mut results = Vec::new();
+    let mut rest = &b;
+    while rest.starts_with(prefix.as_bytes()) {
+        rest = &rest[prefix.len()..];
+        if let Some(rest) = rest.strip_prefix(b"\r\n") {
+            let (head, tail) = rest.split_once(b"\r\n--").unwrap_or((&rest[..], &[][..]));
+            let name = extract_field(head, "name").unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let bytes = head.replace("Content-Disposition:", "").replace("Content-Type:", "");
+            results.push((name, bytes));
+            rest = tail;
+        } else {
             break;
         }
-        body.extend_from_slice(&buf[..n]);
     }
-    Ok(body)
+    results
 }
 
-/// Splits a multipart/form-data body into (name, value) pairs.
-fn parse_multipart(body: &[u8], boundary: &str) -> HashMap<String, String> {
-    let mut parts: HashMap<String, String> = HashMap::new();
-    let marker = format!("\r\n--{boundary}--");
-    let chunks = body.split(format!("--{boundary}"));
+fn extract_invoice(fields: &[(String, Vec<u8>)]) -> ProcessedDocument {
+    let find = |n: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == n)
+            .map(|(_, v)| String::from_utf8_lossy(v).into_owned())
+    };
+    let find_f64 = |n: &str| {
+        fields
+            .iter()
+            .find(|(k, _)| k == n)
+            .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+    };
+    ProcessedDocument {
+        page: None,
+        fatura_no: find("faturaNumarasi"),
+        fatura_tarihi: find("faturaTarihi"),
+        cari_unvan: find("saticiUnvan"),
+        cari_vergi_no: find("saticiVknTckn"),
+        ettn_uuid: find("ettn_uuid"),
+        mal_hizmet_toplam_matrah: find_f64("genel_toplam").unwrap_or(0.0),
+        kdv_orani: find_f64("kdvOrani").unwrap_or(0.0),
+        kdv_tutari: find_f64("kdvTutari").unwrap_or(0.0),
+        genel_toplam: find_f64("genel_toplam").unwrap_or(0.0),
+        kalemler: Vec::new(),
+    }
+}
 
-    for chunk in chunks {
-        let chunk = chunk.trim();
-        let chunk = chunk.strip_suffix(marker.as_bytes()).unwrap_or(chunk);
-        let chunk = chunk.strip_suffix(b"\r\n").unwrap_or(chunk);
+fn save_upload(image_data: &[u8]) -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let uuid = Uuid::new_v4();
+    let path = dir.join(format!("fatrocu_upload_{}_{}.png", stamp, uuid));
+    std::fs::write(&path, image_data)?;
+    Ok(path)
+}
 
-        let header_end = match chunk.iter().position(|&b| b == b'\r') {
-            Some(i) => i,
-            None => continue,
-        };
-        let header = &chunk[..header_end];
-        let header = String::from_utf8_lossy(header);
-
-        if let Some(pos) = header.find("name=\"") {
-            let end = header[pos + "name=\"".len()..]
-                .find('"')
-                .map(|i| pos + "name=\"".len() + i)
-                .unwrap_or(0);
-            let name = &header[header.find("name=").unwrap_or(0) + "name=".len()..end];
-            let value = &chunk[header_end + 2..];
-            if let Some(value_end) = value.iter().position(|&b| b == b'\r') {
-                let value = &value[..value_end];
-                parts.insert(
-                    name.to_string(),
-                    String::from_utf8_lossy(value).to_string(),
-                );
+async fn run_llama(
+    image_path: &PathBuf,
+    model: &str,
+    temp: f64,
+    n_predict: u32,
+    ctx_size: u32,
+) -> Result<String, String> {
+    let runner = runner_path();
+    match &runner {
+        Some(path) if std::path::Path::new(path).exists() => {
+            let output = Command::new(path)
+                .arg("--model")
+                .arg(model)
+                .arg(image_path)
+                .arg("--temp")
+                .arg(format!("{temp}"))
+                .arg("--threads")
+                .arg("4")
+                .arg("--gpu-layers")
+                .arg("0")
+                .arg("--ctx-size")
+                .arg(format!("{ctx_size}"))
+                .arg("--n-predict")
+                .arg(format!("{n_predict}"))
+                .output()
+                .map_err(|e| format!("runner failed: {e}"))?;
+            if !output.status.success() {
+                return Err("runner exited with error".to_string());
             }
+            String::from_utf8(output.stdout.clone())
+                .map_err(|_| "runner produced non-utf8 output".to_string())
+        }
+        _ => Err("FATROCU_SERVER_BIN not set or runner not found".to_string()),
+    }
+}
+
+async fn parse_and_extract(
+    image_data: &[u8],
+    params: &TextParams,
+) -> Result<ProcessedDocument, String> {
+    let image_path = save_upload(image_data)?;
+    let runner = runner_path();
+    match &runner {
+        Some(path) if std::path::Path::new(path).exists() => {
+            let raw = run_llama(
+                &image_path,
+                &params.model,
+                params.temp,
+                params.n_predict,
+                params.ctx_size,
+            )
+            .await
+            .map_err(|e| format!("extraction failed: {e}"))?;
+            serde_json::from_str::<ProcessedDocument>(&raw)
+                .map_err(|e| format!("parse failed: {e}"))
+        }
+        _ => Err("FATROCU_SERVER_BIN not set or runner not found".to_string()),
+    }
+}
+
+#[derive(Debug)]
+struct Service {
+    invoices: Vec<ProcessedDocument>,
+}
+
+impl Default for Service {
+    fn default() -> Self {
+        Self {
+            invoices: Vec::new(),
         }
     }
-    parts
 }
 
-/// Resolves the configured runner path (or a friendly message if unset).
-fn resolve_runner() -> Result<(PathBuf, String), Error> {
-    match runner_path() {
-        Some(p) => {
-            let _ = std::fs::metadata(&p);
-            Ok((p, String::new()))
-        }
-        None => Err(Error::InternalServerError(
-            "Fatrocu runner is not configured: set FATROCU_SERVER_BIN to the path of the Fatrocu model runner binary",
-        )),
-    }
+async fn health() -> impl Responder {
+    let runner = runner_path();
+    HttpResponse::Ok().json(HealthResponse {
+        status: "ok".to_string(),
+        model: CANONICAL_MODEL.to_string(),
+        canonical_model: CANONICAL_MODEL.to_string(),
+        version: env!("CARGO_PKG_VERSION"),
+        runner: runner.as_deref().map(|s| s.to_string()),
+    })
 }
 
-/// Returns the model name used by the runner, defaulting to the canonical name.
-fn model_name() -> String {
-    let mut name = env::var("FATROCU_MODEL_NAME")
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if name.is_empty() {
-        name = CANONICAL_MODEL.to_string();
-    }
-    name
-}
-
-#[get("/health")]
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(json!({
-        "status": "ok",
-        "model": model_name(),
-        "canonical_model": CANONICAL_MODEL,
-        "version": SERVER_VERSION,
-        "runner": match runner_path() {
-            Some(p) => format!("{} (configured)", p.display()),
-            None => "unconfigured".to_string(),
-        },
-    }))
-}
-
-/// POST /process — accept a single image file plus optional text fields,
-/// pass them to the runner, and return the JSON extraction result.
 #[post("/process")]
 async fn process(
-    req: HttpRequest,
-    payload: impl MessageBody,
-) -> Result<HttpResponse, Error> {
-    let content_type = req
-        .content_type()
-        .unwrap_or("application/octet-stream")
-        .to_string();
-
-    // Multipart body (image file + text params) or a single JSON payload.
-    let parsed = match read_body(&req).await {
-        Ok(bytes) => parse_multipart(&bytes, &content_type).ok(),
-        Err(_) => None,
-    };
-
-    // Fall back to a raw JSON body if multipart parsing failed.
-    let fields: HashMap<String, String> = if parsed.is_none() {
-        serde_json::from_slice::<serde_json::Value>(&read_body(&req).await.unwrap_or_default())
-            .ok()
-            .and_then(|v| {
-                v.as_object()
-                    .map(|m| m.iter().map(|(k, val)| (k.clone(), val.as_str().unwrap_or("").to_string())).collect())
-            })
-    } else {
-        parsed
-    };
-
-    let fields = match fields {
-        Some(f) => f,
-        None => return Err(Error::BadRequest("no form fields found in request body")),
-    };
-
-    let image_name = fields
-        .get("image")
-        .or_else(|| fields.get("file"))
-        .or_else(|| fields.get("image_file"))
-        .cloned()
-        .ok_or_else(|| Error::BadRequest("missing image file field (expected 'image' or 'file')"))?;
-
-    let model = fields.get("model").cloned().unwrap_or_else(|| model_name());
-    let temp = fields.get("temp").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.2);
-    let n_predict = fields
-        .get("n_predict")
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(8);
-    let ctx_size = fields
-        .get("ctx_size")
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(256);
-
-    let tmp_path = format!(
-        "fatrocu_upload_{}_{}.png",
-        model,
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
-    );
-    let tmp_path = PathBuf::from(&tmp_path);
-    let parent = tmp_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
-    let _ = std::fs::create_dir_all(parent);
-
-    // Save the uploaded image bytes to a temp file so the runner can read them.
-    let image_data = match &image_name {
-        Some(name) => {
-            let part = parse_multipart(&read_body(&req).await.unwrap_or_default(), &content_type);
-            if let Some(bytes) = part.get(name).map(String::as_bytes).flatten() {
-                File::create(&tmp_path)
-                    .and_then(|mut f| f.write_all(bytes))
-                    .and_then(|_| f.flush())
-                    .map_err(|e| Error::InternalServerError(format!("failed to save image: {e}")))?;
-                Some(&tmp_path)
-            } else {
-                None
-            }
-        }
-        None => None,
-    };
-
-    // Build the runner argument list: model + image + tunables.
-    let mut args: Vec<String> = vec![model.clone()];
-    if let Some(path) = image_data {
-        args.push(path.display().to_string());
+    body: impl MessageBody,
+    params: actix_web::web::Query<TextParams>,
+) -> Result<impl Responder, String> {
+    let image_data = body.into_data().await
+        .map_err(|e| format!("read error: {e}"))?;
+    if image_data.is_empty() {
+        return Err("no image data".to_string());
     }
-    args.push("--temp".into());
-    args.push(temp.to_string());
-    args.push("--n_predict".into());
-    args.push(n_predict.to_string());
-    args.push("--ctx_size".into());
-    args.push(ctx_size.to_string());
-
-    // Run the external model runner. If it fails or is missing, return a clear
-    // error instead of crashing the server.
-    let (_, runner_note) = resolve_runner()?;
-    let (stdout, stderr) = match (&image_data, &args) {
-        (Some(img), args) => match env::var("FATROCU_SERVER_BIN") {
-            Ok(bin) => {
-                let mut cmd = std::process::Command::new(&bin);
-                cmd.arg(args);
-                if let Some(img) = img {
-                    cmd.arg(img);
-                }
-                let output = cmd.output().map_err(|e| {
-                    Error::InternalServerError(format!("failed to start runner: {e}"))
-                })?;
-                (
-                    String::from_utf8_lossy(&output.stdout).to_string(),
-                    String::from_utf8_lossy(&output.stderr).to_string(),
-                )
-            }
-            Err(_) => (
-                String::new(),
-                format!(
-                    "runner not configured (set FATROCU_SERVER_BIN); model: {}",
-                    model
-                ),
-            ),
-        },
-        (None, _) => (
-            String::new(),
-            "no image provided to runner".to_string(),
-        ),
-    };
-
-    Ok(HttpResponse::Ok().json(json!({
-        "model": model,
-        "runner_status": runner_note,
-        "ok": image_data.is_some(),
-        "raw_stdout": stdout,
-        "raw_stderr": stderr,
-    })))
+    let doc = parse_and_extract(&image_data, &params)
+        .await
+        .map_err(|e| format!("extraction error: {e}"))?;
+    crate::AppState::instance(uuid::Uuid::new_v4().as_u128())
+        .set_invoice(doc.clone());
+    HttpResponse::Ok().json(doc)
 }
 
-/// GET /invoices — returns the list of previously extracted invoices (stored
-/// under a sidecar path so the server stays a pure HTTP service).
-#[get("/invoices")]
-async fn invoices() -> HttpResponse {
-    let home = env::temp_dir();
-    let path = home.join("fatrocu_invoices.json");
-    match std::fs::read_to_string(&path) {
-        Ok(text) => HttpResponse::Ok().json(serde_json::from_str::<Vec<serde_json::Value>>(&text).unwrap_or_default()),
-        Err(_) => HttpResponse::Ok().json(Vec::<serde_json::Value>::new()),
-    }
+async fn list() -> Result<impl Responder, String> {
+    let invoices = crate::AppState::instance(0).get_invoices();
+    let resp = InvoicesResponse {
+        count: invoices.len(),
+        invoices: invoices.clone(),
+    };
+    Ok(HttpResponse::Ok().json(resp))
 }
 
-/// GET /export — writes a real .xlsx report using rust_xlsxwriter.
-#[get("/export")]
-async fn export_xlsx() -> HttpResponse {
-    let home = env::temp_dir();
-    let path = home.join("Fatrocu_Raporu.xlsx");
-    {
-        let file = match File::create(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                return HttpResponse::InternalServerError().body(format!("failed to create report: {e}"))
-            }
-        };
-        let mut writer = rust_xlsxwriter::Writer::new(file).unwrap();
-        let mut ws = writer.add_worksheet("Invoices").unwrap();
-        let _ = ws.write_string(0, "Fatrocu Report").unwrap();
-        let _ = ws.write_string(1, "model").unwrap();
-        let _ = ws.write_string(2, CANONICAL_MODEL).unwrap();
-        let _ = writer.save().unwrap();
-    }
-    HttpResponse::Ok().attachment("Fatrocu_Raporu.xlsx").body(path.display().to_string())
+async fn export() -> Result<impl Responder, String> {
+    let invoices = crate::AppState::instance(0).get_invoices();
+    let file = save_xlsx(&invoices)?;
+    Ok(HttpResponse::Ok()
+        .content_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        .attachment("Fatrocu_Raporu.xlsx", file))
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    let _ = actix_web::dotenv::dotenv();
+fn save_xlsx(invoices: &[ProcessedDocument]) -> std::io::Result<PathBuf> {
+    let file = std::fs::File::create("Fatrocu_Raporu.xlsx")?;
+    use rust_xlsxwriter::{Sheet, Workbook, XlsxWriter};
+    let mut workbook = Workbook::new(file)?;
+    let mut sheet = workbook.add_worksheet()?;
+    let mut row = 0i32;
+    sheet.write(0, 0, "Page")?;
+    sheet.write(0, 1, "Fatura No")?;
+    sheet.write(0, 2, "Fatura Tarihi")?;
+    sheet.write(0, 3, "Satıcı Ünvan")?;
+    sheet.write(0, 4, "Satıcı VKN/TCKN")?;
+    sheet.write(0, 5, "Matrah")?;
+    sheet.write(0, 6, "KDV Oranı")?;
+    sheet.write(0, 7, "KDV Tutarı")?;
+    sheet.write(0, 8, "Genel Toplam")?;
+    sheet.write(0, 9, "ETTN UUID")?;
+    row += 1;
+    for inv in invoices {
+        let p = inv.page.clone().unwrap_or_default();
+        let n = inv.fatura_no.clone().unwrap_or_default();
+        let t = inv.fatura_tarihi.clone().unwrap_or_default();
+        let u = inv.cari_unvan.clone().unwrap_or_default();
+        let v = inv.cari_vergi_no.clone().unwrap_or_default();
+        let m = inv.mal_hizmet_toplam_matrah;
+        let k = inv.kdv_orani;
+        let d = inv.kdv_tutari;
+        let g = inv.genel_toplam;
+        let e = inv.ettn_uuid.clone().unwrap_or_default();
+        sheet.write(row, 0, &p)?;
+        sheet.write(row, 1, &n)?;
+        sheet.write(row, 2, &t)?;
+        sheet.write(row, 3, &u)?;
+        sheet.write(row, 4, &v)?;
+        sheet.write(row, 5, &m)?;
+        sheet.write(row, 6, &k)?;
+        sheet.write(row, 7, &d)?;
+        sheet.write(row, 8, &g)?;
+        sheet.write(row, 9, &e)?;
+        row += 1;
+    }
+    let mut opts = Sheet::default();
+    opts.set_column_width(0, 0, 60)?;
+    sheet.finish(&mut opts)?;
+    sheet.finish(&mut workbook)?;
+    workbook.finish()?;
+    Ok(std::path::PathBuf::from("Fatrocu_Raporu.xlsx"))
+}
 
-    let port = env::var("FATROCU_SERVER_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .unwrap_or(1842);
-
-    println!("Fatrocu server starting on 0.0.0.0:{port}");
-
-    let app = web::App::new()
-        .wrap(Logger::default())
-        .route("/health", web::get().to(health))
-        .route("/process", web::post().to(process))
-        .route("/invoices", web::get().to(invoices))
-        .route("/export", web::get().to(export_xlsx));
-
-    actix_web::HttpServer::new(|| {
+fn main() {
+    let _ = dotenv().ok();
+    let addr = format!("0.0.0.0:{}", std::env::var("FATROCU_SERVER_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string()));
+    println!("Fatrocu Server listening on {addr}");
+    println!("Canonical model: {CANONICAL_MODEL}");
+    let app = App::new().service(health).service(process).service(list).service(export);
+    actix_web::HttpServer::new(move || {
         let app = app.clone();
-        app
+        Logger::default().wrap(app)
     })
-    .bind(("0.0.0.0", port))?
-    .run()
-    .await
+    .listen(addr)
+    .unwrap_or_else(|e| panic!("server bootstrap failed: {e}"));
 }
