@@ -1,15 +1,12 @@
-use actix_web::app::App;
 use actix_web::body::MessageBody;
 use actix_web::middleware::Logger;
 use actix_web::post;
-use actix_web::prelude::*;
-use actix_web::HttpResponse;
-use actix_web::HttpRequest;
+use actix_web::web::Query;
+use actix_web::{get, HttpResponse, Responder};
+use actix_web::App;
 
 use dotenv::dotenv;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::io::Read;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
@@ -285,10 +282,52 @@ async fn export() -> Result<impl Responder, String> {
 }
 
 fn save_xlsx(invoices: &[ProcessedDocument]) -> std::io::Result<PathBuf> {
-    let file = std::fs::File::create("Fatrocu_Raporu.xlsx")?;
-    use rust_xlsxwriter::{Sheet, Workbook, XlsxWriter};
-    let mut workbook = Workbook::new(file)?;
+    use rust_xlsxwriter::{Sheet, Workbook};
+    let path = std::path::PathBuf::from("Fatrocu_Raporu.xlsx");
+    let mut workbook = Workbook::new();
     let mut sheet = workbook.add_worksheet()?;
+    let mut row = 0i32;
+    sheet.write(0, 0, "Page")?;
+    sheet.write(0, 1, "Fatura No")?;
+    sheet.write(0, 2, "Fatura Tarihi")?;
+    sheet.write(0, 3, "Satıcı Ünvan")?;
+    sheet.write(0, 4, "Satıcı VKN/TCKN")?;
+    sheet.write(0, 5, "Matrah")?;
+    sheet.write(0, 6, "KDV Oranı")?;
+    sheet.write(0, 7, "KDV Tutarı")?;
+    sheet.write(0, 8, "Genel Toplam")?;
+    sheet.write(0, 9, "ETTN UUID")?;
+    row += 1;
+    for inv in invoices {
+        let p = inv.page.clone().unwrap_or_default();
+        let n = inv.fatura_no.clone().unwrap_or_default();
+        let t = inv.fatura_tarihi.clone().unwrap_or_default();
+        let u = inv.cari_unvan.clone().unwrap_or_default();
+        let v = inv.cari_vergi_no.clone().unwrap_or_default();
+        let m = inv.mal_hizmet_toplam_matrah;
+        let k = inv.kdv_orani;
+        let d = inv.kdv_tutari;
+        let g = inv.genel_toplam;
+        let e = inv.ettn_uuid.clone().unwrap_or_default();
+        sheet.write(row, 0, &p)?;
+        sheet.write(row, 1, &n)?;
+        sheet.write(row, 2, &t)?;
+        sheet.write(row, 3, &u)?;
+        sheet.write(row, 4, &v)?;
+        sheet.write(row, 5, &m)?;
+        sheet.write(row, 6, &k)?;
+        sheet.write(row, 7, &d)?;
+        sheet.write(row, 8, &g)?;
+        sheet.write(row, 9, &e)?;
+        row += 1;
+    }
+    let mut opts = Sheet::default();
+    opts.set_column_width(0, 0, 60)?;
+    sheet.finish(&mut opts)?;
+    sheet.finish(&mut workbook)?;
+    workbook.write_to_file(&path)?;
+    Ok(path)
+}
     let mut row = 0i32;
     sheet.write(0, 0, "Page")?;
     sheet.write(0, 1, "Fatura No")?;
