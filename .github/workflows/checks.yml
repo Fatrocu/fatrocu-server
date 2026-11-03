@@ -1,0 +1,34 @@
+name: Server checks
+on:
+  pull_request:
+  push:
+    branches: ['codex/**']
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fatrocu-server
+      - name: Read core revision
+        shell: pwsh
+        run: '"CORE_REVISION=$(Get-Content fatrocu-server/core-revision.txt)" | Out-File -FilePath $env:GITHUB_ENV -Append'
+      - uses: actions/checkout@v4
+        with:
+          repository: Fatrocu/fatrocu-cli
+          ref: ${{ env.CORE_REVISION }}
+          path: fatrocu-cli
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+        working-directory: fatrocu-server
+      - run: cargo test --locked --all-targets
+        working-directory: fatrocu-server
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: fatrocu-server
