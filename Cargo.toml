@@ -1,6 +1,6 @@
 [package]
 name = "fatrocu-server"
-version = "3.1.0"
+version = "3.1.0-beta.1"
 edition = "2024"
 description = "Verified llama.cpp and multimodal model setup for Windows and Linux"
 license = "MIT"
