@@ -644,4 +644,16 @@ mod tests {
         c.api_key_env = Some("MODEL_API_KEY".into());
         assert!(c.validate().is_ok());
     }
+    #[test]
+    #[ignore = "Downloads a public runtime artifact; run explicitly during platform integration"]
+    fn verified_runtime_archive_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = install_runtime(root.path(), RUNTIME_TAG).unwrap();
+        let output = Command::new(binary).arg("--version").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

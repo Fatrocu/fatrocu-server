@@ -32,3 +32,7 @@ jobs:
         working-directory: fatrocu-server
       - run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: fatrocu-server
+      - name: Verify Linux runtime download and executable
+        if: runner.os == 'Linux'
+        run: cargo test --locked verified_runtime_archive_starts -- --ignored
+        working-directory: fatrocu-server
