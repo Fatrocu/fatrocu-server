@@ -596,13 +596,13 @@ fn launch_script(root: &Path) -> Result<()> {
             exe.display(),
             root.display()
         )?;
+        Ok(())
     }
     #[cfg(not(windows))]
     {
         let _ = root;
         anyhow::bail!("Desktop launch scripts are only available on Windows");
     }
-    Ok(())
 }
 #[cfg(test)]
 mod tests {
