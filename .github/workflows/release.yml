@@ -1,0 +1,38 @@
+name: Build unsigned beta candidate
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/release-3.1.0-beta.1']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: fatrocu-server
+      - name: Read core revision
+        shell: pwsh
+        run: '"CORE_REVISION=$(Get-Content fatrocu-server/core-revision.txt)" | Out-File -FilePath $env:GITHUB_ENV -Append'
+      - uses: actions/checkout@v4
+        with:
+          repository: Fatrocu/fatrocu-cli
+          ref: ${{ env.CORE_REVISION }}
+          path: fatrocu-cli
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --all-targets
+        working-directory: fatrocu-server
+      - run: cargo build --locked --release
+        working-directory: fatrocu-server
+      - name: Package and smoke-test unsigned beta
+        run: python fatrocu-cli/scripts/package-beta.py --product server --root fatrocu-server --output "${{ runner.temp }}/beta-dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beta-fatrocu-server-${{ matrix.os }}
+          path: ${{ runner.temp }}/beta-dist/*
+          if-no-files-found: error
+# Publication is manual; no private data or model weights are packaged.
